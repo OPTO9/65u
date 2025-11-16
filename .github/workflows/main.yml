@@ -1,0 +1,194 @@
+name: Windows RDP via Ngrok (Germany)
+on: [push]
+jobs:
+  rdp-setup:
+    runs-on: windows-latest
+    timeout-minutes: 360  # GitHub Free max runtime is 6 hours
+    steps:
+    - name: Download and extract Ngrok
+      run: |
+        Invoke-WebRequest "https://bin.equinox.io/c/bNyj1mQVY4c/ngrok-stable-windows-amd64.zip" -OutFile ngrok.zip
+        Expand-Archive ngrok.zip -DestinationPath "$env:USERPROFILE"
+        Remove-Item ngrok.zip
+        Copy-Item "$env:USERPROFILE\ngrok.exe" "$env:GITHUB_WORKSPACE"
+        Write-Output "✅ Ngrok downloaded successfully"
+    
+    - name: Verify Ngrok Installation
+      run: |
+        if (Test-Path "$pwd\ngrok.exe") {
+          Write-Output "✅ Ngrok executable found"
+          .\ngrok.exe version
+        } else {
+          Write-Output "::error::Ngrok executable not found"
+          exit 1
+        }
+    
+    - name: Authenticate Ngrok
+      run: |
+        $ErrorActionPreference = "Stop"
+        $token = "${{ secrets.NGROK_AUTH_TOKEN }}"
+        if ([string]::IsNullOrWhiteSpace($token)) {
+          Write-Output "::error::NGROK_AUTH_TOKEN is not set or is empty"
+          exit 1
+        }
+        Write-Output "Authenticating with Ngrok..."
+        .\ngrok.exe config add-authtoken $token
+        Write-Output "✅ Authentication complete"
+    
+    - name: Enable RDP and Firewall
+      run: |
+        Set-ItemProperty -Path "HKLM:\System\CurrentControlSet\Control\Terminal Server" -Name "fDenyTSConnections" -Value 0
+        Enable-NetFirewallRule -DisplayGroup "Remote Desktop"
+        New-NetFirewallRule -DisplayName "Allow RDP via Ngrok" -Direction Inbound -Action Allow -Protocol TCP -LocalPort 3389
+        Write-Output "✅ RDP and Firewall configured"
+    
+    - name: Create Admin User
+      run: |
+        net user kamel007 Kamel@123 /add
+        net localgroup administrators kamel007 /add
+        Write-Output "✅ Admin user created"
+    
+    - name: Start Ngrok Tunnel (Germany Region)
+      run: |
+        # Start ngrok in background with explicit parameters
+        $ngrokArgs = "tcp", "3389", "--region", "eu", "--log", "stdout", "--log-level", "info"
+        $process = Start-Process -FilePath "$pwd\ngrok.exe" -ArgumentList $ngrokArgs -NoNewWindow -PassThru -RedirectStandardOutput ngrok.log -RedirectStandardError ngrok_error.log
+        
+        if (-not $process) {
+          Write-Output "::error::Failed to start Ngrok process"
+          exit 1
+        }
+        
+        Write-Output "Ngrok process started (PID: $($process.Id))"
+        Write-Output "Waiting for tunnel to establish..."
+        Start-Sleep -Seconds 15
+        
+        # Check if process is still running
+        if ($process.HasExited) {
+          Write-Output "::error::Ngrok process exited unexpectedly"
+          Write-Output "=== STDOUT ==="
+          if (Test-Path ngrok.log) { Get-Content ngrok.log }
+          Write-Output "=== STDERR ==="
+          if (Test-Path ngrok_error.log) { Get-Content ngrok_error.log }
+          exit 1
+        }
+        
+        $tunnelUrl = $null
+        $maxAttempts = 24
+        $attempt = 0
+        
+        while ($attempt -lt $maxAttempts -and -not $tunnelUrl) {
+          $attempt++
+          Write-Output "🔍 Attempt $attempt/$maxAttempts - Checking for tunnel..."
+          
+          # Method 1: Try Ngrok API
+          try {
+            $response = Invoke-RestMethod -Uri "http://localhost:4040/api/tunnels" -Method Get -TimeoutSec 5 -ErrorAction Stop
+            if ($response.tunnels -and $response.tunnels.Count -gt 0) {
+              $publicUrl = $response.tunnels[0].public_url
+              if ($publicUrl) {
+                $tunnelUrl = $publicUrl -replace "tcp://", ""
+                Write-Output "✅ Tunnel URL found via API!"
+                break
+              }
+            }
+          } catch {
+            Write-Output "⏳ API not responding yet... ($($_.Exception.Message))"
+          }
+          
+          # Method 2: Parse log file
+          if (-not $tunnelUrl -and (Test-Path ngrok.log)) {
+            $logContent = Get-Content ngrok.log -Raw -ErrorAction SilentlyContinue
+            
+            # Try multiple regex patterns
+            $patterns = @(
+              'url=tcp://([0-9a-zA-Z\.\-]+:\d+)',
+              'Tunnel established at tcp://([0-9a-zA-Z\.\-]+:\d+)',
+              'tcp://([0-9a-zA-Z\.\-]+:\d+)'
+            )
+            
+            foreach ($pattern in $patterns) {
+              if ($logContent -match $pattern) {
+                $tunnelUrl = $matches[1]
+                Write-Output "✅ Tunnel URL found via log file!"
+                break
+              }
+            }
+          }
+          
+          if (-not $tunnelUrl) {
+            Start-Sleep -Seconds 5
+          }
+        }
+        
+        # If still no tunnel, show detailed error information
+        if (-not $tunnelUrl) {
+          Write-Output "::error::Could not establish Ngrok tunnel after $maxAttempts attempts"
+          Write-Output ""
+          Write-Output "=== NGROK STDOUT LOG ==="
+          if (Test-Path ngrok.log) { 
+            Get-Content ngrok.log 
+          } else {
+            Write-Output "Log file not found"
+          }
+          Write-Output ""
+          Write-Output "=== NGROK STDERR LOG ==="
+          if (Test-Path ngrok_error.log) { 
+            Get-Content ngrok_error.log 
+          } else {
+            Write-Output "Error log file not found"
+          }
+          Write-Output ""
+          Write-Output "=== TROUBLESHOOTING ==="
+          Write-Output "1. Verify NGROK_AUTH_TOKEN is correctly set in repository secrets"
+          Write-Output "2. Check if your Ngrok account is active and not rate-limited"
+          Write-Output "3. Try using --region us instead of eu if Europe region has issues"
+          exit 1
+        }
+        
+        # Success! Display connection information
+        Write-Output ""
+        Write-Output "============================================"
+        Write-Output "||     ✅ RDP CONNECTION DETAILS (EU)    ||"
+        Write-Output "============================================"
+        Write-Output "Address: $tunnelUrl"
+        Write-Output "Username: kamel007"
+        Write-Output "Password: Kamel@123"
+        Write-Output "Region: Europe (Germany)"
+        Write-Output "--------------------------------------------"
+        Write-Output "Instructions:"
+        Write-Output "1. Press Win + R, type 'mstsc' and hit Enter"
+        Write-Output "2. Connect to: $tunnelUrl"
+        Write-Output "3. Use credentials above"
+        Write-Output "============================================"
+        Write-Output ""
+        Write-Output "🟢 Session active - Connect now!"
+        Write-Output ""
+        
+        # Keep session alive with periodic heartbeat
+        $counter = 0
+        while ($true) { 
+          Start-Sleep -Seconds 60
+          $counter++
+          $elapsed = $counter
+          Write-Output "⏱️ Session running for $elapsed minutes | Status: Active"
+          
+          # Verify ngrok is still running every 5 minutes
+          if ($counter % 5 -eq 0) {
+            try {
+              $check = Invoke-RestMethod -Uri "http://localhost:4040/api/tunnels" -TimeoutSec 5
+              if ($check.tunnels.Count -eq 0) {
+                Write-Output "::warning::Tunnel appears to be down, but keeping session alive"
+              }
+            } catch {
+              Write-Output "::warning::Cannot reach Ngrok API, but keeping session alive"
+            }
+          }
+        }
+    
+    - name: Cleanup Ngrok
+      if: always()
+      run: |
+        Write-Output "Cleaning up Ngrok processes..."
+        Stop-Process -Name "ngrok" -Force -ErrorAction SilentlyContinue
+        Write-Output "✅ Cleanup complete"
